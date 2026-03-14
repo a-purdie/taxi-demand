@@ -1,6 +1,6 @@
 duckdb==1.4.4
 jupyterlab==4.5.3
 matplotlib==3.10.8
-psycopg2-binary==2.9.11
 pyarrow==23.0.0
 requests==2.32.5
+geopandas==1.1.3

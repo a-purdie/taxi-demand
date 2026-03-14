@@ -24,21 +24,23 @@ import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-
 import duckdb
 import pyarrow as pa
-
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-
-from ingest import (
-    CANONICAL_SCHEMAS,
-    DATA_DIR,
-    TAXI_TYPES,
-    YELLOW_DROP,
-    YELLOW_RENAMES,
+from constants import TAXI_TYPES, DATA_DIR, PROJECT_ROOT
+from schemas import (
+    YELLOW_COLUMNS, YELLOW_CANONICAL_NAMES, YELLOW_RENAMES, YELLOW_DROP, 
+    GREEN_COLUMNS, FHV_COLUMNS, FHVHV_COLUMNS
 )
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+CANONICAL_SCHEMAS = {
+    "yellow": YELLOW_COLUMNS,
+    "green": GREEN_COLUMNS,
+    "fhv": FHV_COLUMNS,
+    "fhvhv": FHVHV_COLUMNS,
+}
 
 # Map Arrow types from ingest.py schemas to DuckDB SQL cast types
 _ARROW_TO_DUCKDB = {
@@ -92,7 +94,7 @@ def _build_yellow_view(con, data_dir):
         alias_groups[canonical].append(raw)
 
     selects = []
-    for col_name, _, arrow_type in CANONICAL_SCHEMAS["yellow"]:
+    for col_name, arrow_type in CANONICAL_SCHEMAS["yellow"]:
         # All candidates: the canonical name + any aliases
         candidates = [col_name] + alias_groups.get(col_name, [])
         # Keep only those that actually exist in the parquet files
@@ -123,7 +125,7 @@ def _build_simple_view(con, taxi_type, data_dir):
     available = _get_union_columns(con, glob)
 
     selects = []
-    for col_name, _, arrow_type in CANONICAL_SCHEMAS[taxi_type]:
+    for col_name, arrow_type in CANONICAL_SCHEMAS[taxi_type]:
         duckdb_type = _ARROW_TO_DUCKDB.get(arrow_type, "VARCHAR")
         if col_name.lower() in available:
             actual = available[col_name.lower()]
