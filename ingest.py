@@ -18,14 +18,19 @@ Usage examples:
 import argparse
 import threading
 import time
+import io
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 import requests
+import geopandas as gpd
+import pyarrow.parquet as pq
+import pyarrow as pa
 from constants import TAXI_TYPES, DATA_DIR
 
 BASE_URL = "https://d37ci6vzurychx.cloudfront.net/trip-data"
-
+SHAPE_FILE_PATH = Path("data/zones/taxi_zones.shp")
 
 # Lock for thread-safe printing
 _print_lock = threading.Lock()
@@ -34,6 +39,8 @@ _print_lock = threading.Lock()
 _rate_limit_lock = threading.Lock()
 _rate_limit_until = 0.0  # monotonic timestamp
 
+zones_gdf = gpd.read_file(SHAPE_FILE_PATH)
+zones_gdf = zones_gdf.to_crs(epsg=4326)
 
 def log(msg):
     with _print_lock:
@@ -50,6 +57,22 @@ def generate_months(start, end):
             current = current.replace(year=current.year + 1, month=1)
         else:
             current = current.replace(month=current.month + 1)
+
+def download_shapefile(data_dir):
+    shapefile_url = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip"
+    shapefile_path = data_dir / "zones" / "taxi_zones.shp"
+    if shapefile_path.exists():
+        print("Taxi zone shapefile already exists, skipping")
+        return shapefile_path
+    print("Downloading taxi zone shapefile...")
+    resp = requests.get(shapefile_url)
+    resp.raise_for_status()
+    extract_dir = data_dir / "zones"
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        zf.extractall(extract_dir)
+
+    print(f"Extracted to {extract_dir}")
+    return shapefile_path
 
 
 def download_file(url, dest, quiet=False, cooldown=30, max_retries=5):
@@ -73,17 +96,13 @@ def download_file(url, dest, quiet=False, cooldown=30, max_retries=5):
             return False
 
         if resp.status_code == 403:
-            if attempt == 0:
-                # First 403: could be rate limiting or missing file. Set cooldown and retry.
-                with _rate_limit_lock:
-                    now = time.monotonic()
-                    if now >= _rate_limit_until:
-                        _rate_limit_until = now + cooldown
-                        log(f"  Got 403, pausing {cooldown}s before retry...")
-                continue
-            else:
-                # Still 403 after cooldown: file genuinely doesn't exist
-                return False
+            with _rate_limit_lock:
+                now = time.monotonic()
+                if now >= _rate_limit_until:
+                    _rate_limit_until = now + cooldown
+                    log(f"  Got 403, pausing {cooldown}s before retry...")
+                    cooldown *= 2
+            continue
 
         resp.raise_for_status()
 
@@ -107,15 +126,75 @@ def download_file(url, dest, quiet=False, cooldown=30, max_retries=5):
     log(f"  Failed after {max_retries} retries: {url}")
     return False
 
+def assign_zones(parquet_file_path, zones_gdf):
+    parquet_file = pq.ParquetFile(parquet_file_path)
+    schema = parquet_file.schema_arrow
+    location_in_degrees = "start_lon" in schema.names
+    if not location_in_degrees:
+        return
+    print(f"{parquet_file_path} needs zone assignment. Assigning zones...")
+    tmp_path = parquet_file_path.with_suffix(".tmp.parquet")
+    writer = None
 
-def download_one(taxi_type, month, data_dir, dl_semaphore, parallel=False):
+    try:
+        for batch in parquet_file.iter_batches(batch_size=500000):
+            batch_dataframe = batch.to_pandas()
+
+            pickup_points = gpd.GeoDataFrame(
+                batch_dataframe,
+                geometry=gpd.points_from_xy(
+                    batch_dataframe['start_lon'], 
+                    batch_dataframe['start_lat']
+                ), 
+                crs="EPSG:4326"
+            )
+
+            batch_dataframe['pulocationid'] = gpd.sjoin(
+                pickup_points, zones_gdf, how="left", predicate="within"
+            )["LocationID"]
+
+            dropoff_points = gpd.GeoDataFrame(
+                batch_dataframe,
+                geometry=gpd.points_from_xy(
+                    batch_dataframe['end_lon'],
+                    batch_dataframe['end_lat']
+                ),
+                crs="EPSG:4326"
+            )
+
+            batch_dataframe["dolocationid"] = gpd.sjoin(
+                dropoff_points, zones_gdf, how="left", predicate="within"
+            )["LocationID"]
+
+            batch_dataframe = batch_dataframe.drop(columns=[
+                "start_lon", "start_lat", "end_lon", "end_lat"
+            ])
+
+            table = pa.Table.from_pandas(batch_dataframe)
+
+            if writer is None:
+                writer = pq.ParquetWriter(tmp_path, table.schema)
+            writer.write_table(table)
+        
+        if writer:
+            writer.close()
+            tmp_path.replace(parquet_file_path)
+
+    except Exception:
+        if writer:
+            writer.close()
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+def download_one(taxi_type, month, data_dir, dl_semaphore, parallel=False, replace=False):
     """Download a single file. Returns (taxi_type, month, status, elapsed)."""
     filename = f"{taxi_type}_tripdata_{month}.parquet"
     filepath = data_dir / filename
     url = f"{BASE_URL}/{filename}"
     t0 = time.monotonic()
 
-    if filepath.exists():
+    if filepath.exists() and not replace:
         size_mb = filepath.stat().st_size / 1024 / 1024
         if not parallel:
             print(f"  Already downloaded ({size_mb:.1f} MB), skipping")
@@ -127,6 +206,8 @@ def download_one(taxi_type, month, data_dir, dl_semaphore, parallel=False):
         if not parallel:
             print(f"  Downloading {url}")
         ok = download_file(url, filepath, quiet=parallel)
+        if ok and taxi_type == "yellow":
+            assign_zones(filepath, zones_gdf)
     finally:
         dl_semaphore.release()
 
@@ -175,6 +256,12 @@ def parse_args(argv=None):
         help="Max concurrent downloads (default: 2)",
     )
 
+    p.add_argument(
+        "--replace",
+        help="Download files again even if they already exist",
+        action="store_true"
+    )
+
     return p.parse_args(argv)
 
 
@@ -187,7 +274,9 @@ def main():
     print(f"Date range: {args.start} to {args.end} ({len(months)} months)")
     print(f"Total files: {len(args.types) * len(months)}")
     print(f"Download workers: {args.download_workers}")
+    print(f"Replace existing files: {args.replace}")
     print()
+    download_shapefile(DATA_DIR)
 
     # Build work items
     work_items = [
@@ -203,7 +292,10 @@ def main():
         completed = 0
         with ThreadPoolExecutor(max_workers=args.download_workers) as pool:
             futures = {
-                pool.submit(download_one, taxi_type, month, args.data_dir, dl_semaphore, parallel=True): (taxi_type, month)
+                pool.submit(
+                    download_one, taxi_type, month, args.data_dir, 
+                    dl_semaphore, replace=args.replace, parallel=True
+                ): (taxi_type, month)
                 for taxi_type, month in work_items
             }
             for future in as_completed(futures):
